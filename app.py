@@ -42,6 +42,36 @@ Needs "talktu_financial_model(1).xlsx" in the same folder, with a
 "P&L Summary" sheet.
 """
 
+
+import streamlit as st
+
+# --- SÉCURITÉ : VÉRIFICATION DU MOT DE PASSE ---
+def check_password():
+    """Retourne True si l'utilisateur a entre le bon mot de passe."""
+    def password_entered():
+        if st.session_state["password"] == "Talktu2026!":  # Modifie le mot de passe ici
+            st.session_state["password_correct"] = True
+            del st.session_state["password"]  # Ne conserve pas le mot de passe en mémoire
+        else:
+            st.session_state["password_correct"] = False
+
+    if "password_correct" not in st.session_state:
+        # Premier affichage : demande le mot de passe
+        st.text_input("Mot de passe requis pour accéder au cockpit talktü :", type="password", on_change=password_entered, key="password")
+        return False
+    elif not st.session_state["password_correct"]:
+        # Mot de passe incorrect
+        st.text_input("Mot de passe requis pour accéder au cockpit talktü :", type="password", on_change=password_entered, key="password")
+        st.error("😕 Mot de passe incorrect")
+        return False
+    else:
+        # Mot de passe correct
+        return True
+
+if not check_password():
+    st.stop()  # Bloque le chargement du reste de l'application
+# ----------------------------------------------
+
 import numpy as np
 import pandas as pd
 import plotly.express as px
