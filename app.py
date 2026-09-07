@@ -1,4 +1,390 @@
+"""talktü — Financial Cockpit
+Prepared by Zacharie Hossana Dayang, Finance Associate Intern, talktü
+Run: streamlit run app.py  (requires talktu_financial_model(1).xlsx, sheet "P&L Summary")
 """
+
+import re
+
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
+from plotly.subplots import make_subplots
+
+# ---------------------------------------------------------------------------
+# Auth
+# ---------------------------------------------------------------------------
+
+APP_PASSWORD = "Talktu2026!"
+
+
+def check_password() -> bool:
+    def on_change():
+        st.session_state["password_correct"] = st.session_state["password"] == APP_PASSWORD
+        del st.session_state["password"]
+
+    if "password_correct" not in st.session_state:
+        st.text_input("Mot de passe :", type="password", on_change=on_change, key="password")
+        return False
+    if not st.session_state["password_correct"]:
+        st.text_input("Mot de passe :", type="password", on_change=on_change, key="password")
+        st.error("Mot de passe incorrect")
+        return False
+    return True
+
+
+if not check_password():
+    st.stop()
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+st.set_page_config(page_title="talktü — Financial Cockpit", page_icon="📊", layout="wide")
+
+NAVY = "#1B2A4A"
+GOLD = "#B8860B"
+
+st.markdown(
+    """
+    <style>
+    .main { background-color: #0e1117; }
+    .stMetric { background-color: #1e222d; padding: 15px; border-radius: 10px; border: 1px solid #2e364f; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+FILE_PATH = "talktu_financial_model(1).xlsx"
+SHEET_NAME = "P&L Summary"
+
+ROW_LABELS = {
+    "b2c_revenue": "Parent App",
+    "b2b_revenue": "School",
+    "assessment_revenue": "Assessment",
+    "grant_revenue": "Grant",
+    "salaries": "Salar",
+    "tech": "Tech",
+    "marketing": "Marketing",
+    "admin": "Admin",
+    "contingency": "Conting",
+}
+
+OPEX_COLS = ["Salaries & Benefits", "Tech & Hosting", "Marketing", "Admin & Legal", "Contingency"]
+
+B2B_BOUNDS = (-0.30, 0.35)
+B2C_BOUNDS = (-0.20, 0.25)
+OPEX_BOUNDS = (-0.05, 0.15)
+
+MONTH_PATTERN = re.compile(r"^[A-Za-z]{3}-\d{2}$")
+
+# ---------------------------------------------------------------------------
+# Data loading
+# ---------------------------------------------------------------------------
+
+
+def find_row(raw: pd.DataFrame, keyword: str) -> int:
+    col0 = raw.iloc[:, 0].astype(str)
+    matches = col0[col0.str.contains(keyword, case=False, na=False)]
+    if matches.empty:
+        raise ValueError(f"Ligne introuvable pour '{keyword}' dans P&L Summary.")
+    return matches.index[0]
+
+
+def find_months_row(raw: pd.DataFrame) -> int:
+    for i in range(len(raw)):
+        row_vals = raw.iloc[i, 1:13]
+        hits = sum(1 for v in row_vals if pd.notna(v) and MONTH_PATTERN.match(str(v).strip()))
+        if hits >= 6:
+            return i
+    raise ValueError("Ligne des mois introuvable (attendu type 'Aug-26').")
+
+
+@st.cache_data
+def load_financial_data(file_path: str) -> pd.DataFrame:
+    raw = pd.read_excel(file_path, sheet_name=SHEET_NAME, header=None)
+    months_row = find_months_row(raw)
+    months = raw.iloc[months_row, 1:13].values
+
+    def row_values(keyword: str) -> np.ndarray:
+        r = find_row(raw, keyword)
+        return raw.iloc[r, 1:13].values.astype(float)
+
+    return pd.DataFrame({
+        "Month": months,
+        "B2C App Revenue": row_values(ROW_LABELS["b2c_revenue"]),
+        "B2B School Revenue": row_values(ROW_LABELS["b2b_revenue"]),
+        "Assessment Revenue": row_values(ROW_LABELS["assessment_revenue"]),
+        "Grants & Partnerships": row_values(ROW_LABELS["grant_revenue"]),
+        "Salaries & Benefits": row_values(ROW_LABELS["salaries"]),
+        "Tech & Hosting": row_values(ROW_LABELS["tech"]),
+        "Marketing": row_values(ROW_LABELS["marketing"]),
+        "Admin & Legal": row_values(ROW_LABELS["admin"]),
+        "Contingency": row_values(ROW_LABELS["contingency"]),
+    })
+
+
+# ---------------------------------------------------------------------------
+# Financial logic
+# ---------------------------------------------------------------------------
+
+
+def build_scenario(df_raw: pd.DataFrame, b2b_mult: float, b2c_mult: float, opex_mult: float,
+                    starting_cash: float) -> pd.DataFrame:
+    df = df_raw.copy()
+    df["B2B School Revenue"] *= (1 + b2b_mult)
+    df["B2C App Revenue"] *= (1 + b2c_mult)
+    for col in OPEX_COLS:
+        df[col] *= (1 + opex_mult)
+
+    df["Total Revenue"] = (
+        df["B2C App Revenue"] + df["B2B School Revenue"]
+        + df["Assessment Revenue"] + df["Grants & Partnerships"]
+    )
+    df["Total Costs"] = df[OPEX_COLS].sum(axis=1)
+    df["Net Result"] = df["Total Revenue"] - df["Total Costs"]
+    df["Cash Balance"] = starting_cash + df["Net Result"].cumsum()
+    return df
+
+
+def plain_english_summary(runway_months: float, funding_gap: float) -> str:
+    if runway_months >= 12:
+        cash_line = "Cash looks healthy for the full year at this pace."
+    elif runway_months >= 6:
+        cash_line = f"About {runway_months:.1f} months of cash left — worth watching."
+    else:
+        cash_line = f"Only about {runway_months:.1f} months of cash left — needs attention soon."
+
+    if funding_gap > 0:
+        gap_line = f" You may need roughly ₦{funding_gap/1e6:,.1f}M in extra funding to stay safe all year."
+    else:
+        gap_line = " No extra funding looks needed to stay cash-positive for the year."
+    return cash_line + gap_line
+
+
+def break_even_schools(df: pd.DataFrame, price_per_school: float) -> int:
+    avg_gap = (df["Total Costs"] - df["Total Revenue"]).mean()
+    if avg_gap <= 0 or price_per_school <= 0:
+        return 0
+    return int(np.ceil(avg_gap / price_per_school))
+
+
+def tornado_data(df_raw: pd.DataFrame, starting_cash: float, swing: float = 0.20):
+    def end_cash(b2b, b2c, opex):
+        return build_scenario(df_raw, b2b, b2c, opex, starting_cash)["Cash Balance"].iloc[-1]
+
+    base_end_cash = end_cash(0, 0, 0)
+    rows = [
+        ("B2B School Growth", end_cash(-swing, 0, 0), end_cash(swing, 0, 0)),
+        ("B2C App Growth", end_cash(0, -swing, 0), end_cash(0, swing, 0)),
+        ("Operating Costs", end_cash(0, 0, -swing), end_cash(0, 0, swing)),
+    ]
+    out = pd.DataFrame(rows, columns=["Lever", "Low Case", "High Case"])
+    out["Swing (₦M)"] = (out["High Case"] - out["Low Case"]).abs() / 1e6
+    return out.sort_values("Swing (₦M)"), base_end_cash
+
+
+def monte_carlo(df_raw: pd.DataFrame, starting_cash: float,
+                 b2b_low: float, b2b_high: float, b2c_low: float, b2c_high: float,
+                 opex_low: float, opex_high: float, n: int = 1000) -> np.ndarray:
+    results = []
+    for _ in range(n):
+        b2b = np.random.triangular(b2b_low, 0, b2b_high)
+        b2c = np.random.triangular(b2c_low, 0, b2c_high)
+        opex = np.random.triangular(opex_low, 0, opex_high)
+        end_cash = build_scenario(df_raw, b2b, b2c, opex, starting_cash)["Cash Balance"].iloc[-1]
+        results.append(end_cash / 1e6)
+    return np.array(results)
+
+
+def linear_forecast(values: np.ndarray, n_future: int = 6):
+    x = np.arange(len(values))
+    coeffs = np.polyfit(x, values, 1)
+    trend = np.poly1d(coeffs)
+    error_band = (values - trend(x)).std()
+    future_x = np.arange(len(values), len(values) + n_future)
+    return trend(future_x), error_band, coeffs[0]
+
+
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
+
+try:
+    df_raw = load_financial_data(FILE_PATH)
+
+    st.sidebar.title("Control Panel")
+
+    data_mode = st.sidebar.radio(
+        "Data Mode",
+        ["Assumptions (not yet confirmed)", "Real / confirmed data"],
+        help="Switch once Sarah Andino confirms real numbers.",
+    )
+    is_real = data_mode.startswith("Real")
+
+    st.sidebar.markdown("---")
+    scenario = st.sidebar.radio(
+        "Scenario",
+        ["Custom (move sliders)", "Conservative", "Base Case", "Optimistic"],
+    )
+
+    if scenario == "Conservative":
+        b2b_mult, b2c_mult, opex_mult = B2B_BOUNDS[0], B2C_BOUNDS[0], OPEX_BOUNDS[1]
+    elif scenario == "Optimistic":
+        b2b_mult, b2c_mult, opex_mult = B2B_BOUNDS[1], B2C_BOUNDS[1], OPEX_BOUNDS[0]
+    elif scenario == "Base Case":
+        b2b_mult, b2c_mult, opex_mult = 0.0, 0.0, 0.0
+    else:
+        st.sidebar.subheader("Sensitivity")
+        b2b_mult = st.sidebar.slider("B2B School Growth (%)", -50, 100, 0, 5) / 100.0
+        b2c_mult = st.sidebar.slider("B2C App Growth (%)", -50, 100, 0, 5) / 100.0
+        opex_mult = st.sidebar.slider("Cost Change (%)", -30, 50, 0, 5) / 100.0
+
+    st.sidebar.markdown("---")
+    starting_cash = st.sidebar.number_input("Starting Cash (₦)", value=136_214_034, step=5_000_000)
+    price_per_school = st.sidebar.number_input("Price per School (₦/month)", value=225_000, step=5_000)
+
+    df = build_scenario(df_raw, b2b_mult, b2c_mult, opex_mult, starting_cash)
+
+    total_revenue = df["Total Revenue"].sum()
+    total_costs = df["Total Costs"].sum()
+    net_result = df["Net Result"].sum()
+    avg_burn = (df["Total Costs"] - df["Total Revenue"]).mean()
+    runway_months = df["Cash Balance"].iloc[-1] / avg_burn if avg_burn > 0 else 12.0
+    funding_gap = max(0, -df["Cash Balance"].min())
+
+    st.title("talktü — Financial Cockpit")
+    st.caption("Aug 2026 – Jul 2027")
+
+    if is_real:
+        st.success("Data Mode: Real / confirmed data.")
+    else:
+        st.warning(
+            "Data Mode: Assumptions (not yet confirmed) — figures are placeholders. "
+            "Treat forecasts and risk results as a structural test, not real predictions."
+        )
+
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric("Yearly Revenue", f"₦{total_revenue/1e6:,.1f}M", delta=f"{b2b_mult*100:.0f}% B2B")
+    k2.metric("Yearly Costs", f"₦{total_costs/1e6:,.1f}M", delta=f"{opex_mult*100:.0f}% Cost change", delta_color="inverse")
+    k3.metric("Net Result", f"₦{net_result/1e6:,.1f}M")
+    k4.metric("Cash Runway", f"{max(0, runway_months):.1f} months")
+    k5.metric("Funding Gap", f"₦{funding_gap/1e6:,.1f}M", delta_color="inverse")
+
+    st.info(plain_english_summary(max(0, runway_months), funding_gap))
+    st.markdown("---")
+
+    t1, t2, t3, t4, t5, t6 = st.tabs([
+        "Revenue & Cost Mix", "Cash Trajectory", "What Matters Most",
+        "Trend Forecast", "Risk Simulation", "Data & Export",
+    ])
+
+    with t1:
+        c1, c2 = st.columns(2)
+        with c1:
+            rev_data = {
+                "B2C App": df["B2C App Revenue"].sum(),
+                "B2B Schools": df["B2B School Revenue"].sum(),
+                "Assessments": df["Assessment Revenue"].sum(),
+                "Grants": df["Grants & Partnerships"].sum(),
+            }
+            fig = px.pie(names=list(rev_data.keys()), values=list(rev_data.values()),
+                         title="Revenue sources", hole=0.4, color_discrete_sequence=px.colors.qualitative.Pastel)
+            fig.update_traces(textinfo="percent+label")
+            fig.update_layout(template="plotly_dark")
+            st.plotly_chart(fig, width="stretch")
+        with c2:
+            opex_data = {col: df[col].sum() for col in OPEX_COLS}
+            fig = px.pie(names=list(opex_data.keys()), values=list(opex_data.values()),
+                         title="Cost breakdown", hole=0.4, color_discrete_sequence=px.colors.qualitative.Set3)
+            fig.update_traces(textinfo="percent+label")
+            fig.update_layout(template="plotly_dark")
+            st.plotly_chart(fig, width="stretch")
+
+    with t2:
+        fig = make_subplots(specs=[[{"secondary_y": True}]])
+        fig.add_trace(go.Bar(x=df["Month"], y=df["Total Revenue"], name="Revenue", marker_color="#2ecc71"), secondary_y=False)
+        fig.add_trace(go.Bar(x=df["Month"], y=df["Total Costs"], name="Costs", marker_color="#e74c3c"), secondary_y=False)
+        fig.add_trace(go.Scatter(x=df["Month"], y=df["Cash Balance"], name="Cash Balance",
+                                  line=dict(color=GOLD, width=4)), secondary_y=True)
+        fig.update_layout(barmode="group", template="plotly_dark", height=450)
+        fig.update_yaxes(title_text="Monthly flows (₦)", secondary_y=False)
+        fig.update_yaxes(title_text="Cash on hand (₦)", secondary_y=True)
+        st.plotly_chart(fig, width="stretch")
+
+        st.markdown("#### Break-even calculator")
+        extra_schools = break_even_schools(df, price_per_school)
+        if extra_schools == 0:
+            st.success("Revenue already covers costs on average — no extra schools needed.")
+        else:
+            st.warning(f"About **{extra_schools} more schools** (at ₦{price_per_school:,.0f}/month) needed to close the gap.")
+
+    with t3:
+        st.caption("Each lever tested alone, ±20%, others held at 0%.")
+        tornado_df, base_cash = tornado_data(df_raw, starting_cash)
+        fig = go.Figure()
+        fig.add_trace(go.Bar(y=tornado_df["Lever"], x=tornado_df["Swing (₦M)"], orientation="h", marker_color=GOLD))
+        fig.update_layout(
+            template="plotly_dark", height=350,
+            title=f"Impact on year-end cash (Base case ≈ ₦{base_cash/1e6:,.1f}M)",
+            xaxis_title="Swing in year-end cash (₦ Millions)",
+        )
+        st.plotly_chart(fig, width="stretch")
+        st.caption(f"Biggest lever: **{tornado_df.iloc[-1]['Lever']}**.")
+
+    with t4:
+        if not is_real:
+            st.warning("Forecast built on placeholder data — treat as a structural demo, not a real prediction.")
+        else:
+            st.caption("Straight-line trend on 12 months of real data, with a normal error band.")
+
+        forecast, error_band, monthly_trend = linear_forecast(df["Total Revenue"].values, n_future=6)
+        future_months = ["Aug-27", "Sep-27", "Oct-27", "Nov-27", "Dec-27", "Jan-28"]
+
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=list(df["Month"]), y=list(df["Total Revenue"]),
+                                  name="Actual / Modeled Revenue", line=dict(color="#2ecc71", width=3)))
+        fig.add_trace(go.Scatter(x=future_months, y=forecast, name="Trend Forecast",
+                                  line=dict(color="#00d2d3", width=3, dash="dash")))
+        fig.add_trace(go.Scatter(
+            x=future_months + future_months[::-1],
+            y=list(forecast + error_band) + list(forecast - error_band)[::-1],
+            fill="toself", fillcolor="rgba(0,210,211,0.15)", line=dict(width=0),
+            name="Normal error range", showlegend=True,
+        ))
+        fig.update_layout(template="plotly_dark", height=420, xaxis_title="Month", yaxis_title="Revenue (₦)")
+        st.plotly_chart(fig, width="stretch")
+
+        trend_word = "growing" if monthly_trend > 0 else "shrinking"
+        st.caption(f"Revenue trend is roughly **{trend_word}** by ₦{abs(monthly_trend)/1e6:,.2f}M per month.")
+
+    with t5:
+        if not is_real:
+            st.warning("Based on placeholder assumptions — treat as a demo, not a real risk read.")
+        else:
+            st.caption("Triangular distribution built from Conservative/Base/Optimistic bounds.")
+        sim = monte_carlo(df_raw, starting_cash, *B2B_BOUNDS, *B2C_BOUNDS, *OPEX_BOUNDS)
+        fig = px.histogram(sim, nbins=30, title="Distribution of year-end cash (₦ Millions)")
+        fig.update_traces(marker_color="#9b59b6")
+        fig.update_layout(template="plotly_dark", xaxis_title="Year-end cash (₦M)", yaxis_title="Number of simulations")
+        st.plotly_chart(fig, width="stretch")
+
+        pct_negative = (sim < 0).mean() * 100
+        st.warning(f"Cash went negative in **{pct_negative:.0f}%** of the 1,000 simulations.")
+
+    with t6:
+        st.dataframe(df.style.format("{:,.0f}", subset=df.columns[1:]), width="stretch")
+        csv_data = df.to_csv(index=False).encode("utf-8")
+        st.download_button("Download table as CSV", data=csv_data,
+                            file_name="talktu_financial_model_export.csv", mime="text/csv")
+
+except FileNotFoundError:
+    st.error(f"File not found: '{FILE_PATH}'.")
+    st.info("Put this Excel file in the same folder as app.py, then reload.")
+except Exception as e:
+    st.error(f"Something went wrong: {e}")
+    st.info("Check that 'P&L Summary' still has the row labels used above.")"""
 talktü — Financial Cockpit
 Built for: Zacharie Hossana Dayang, Finance Associate Intern, talktü
 Background used to shape this app: Economics/Finance (2 Masters) + Data Science
